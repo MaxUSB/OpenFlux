@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM alpine:3.22
 # ca-certificates: all transports are TLS (wss/https) to Yandex/MAX endpoints.
 # iptables: the exit node must drop kernel RSTs inside its network namespace.
-RUN apk add --no-cache ca-certificates iptables
+RUN apk add --no-cache ca-certificates iptables openssl jq
 
 COPY --from=build /out/openflux /usr/local/bin/openflux
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh

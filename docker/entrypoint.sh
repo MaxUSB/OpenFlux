@@ -22,14 +22,42 @@ case "$role" in
 esac
 
 case "$transport" in
-  yandex|vyandex|oneme) ;;
+  yandex|vyandex|boards|mailru|cupsonline|oneme) ;;
   *)
-    echo "TRANSPORT must be one of yandex, vyandex, oneme (got '$transport')" >&2
+    echo "TRANSPORT must be one of yandex, vyandex, boards, mailru, cupsonline, oneme (got '$transport')" >&2
     exit 2
     ;;
 esac
 
-set -- "--$role" --transport "$transport"
+if [ "$role" = exit-node ] && [ -d /data ]; then
+  if [ -n "${DIRECT_LISTEN:-}" ]; then
+    : "${SHARE_HOST:?Set SHARE_HOST to the public IP or DNS name of the Docker host}"
+  fi
+  if [ ! -s /data/channel.key ]; then
+    umask 077
+    openssl rand -hex 32 > /data/channel.key
+  fi
+  set -- --role=exit --mode=l4 --encryption-key-file=/data/channel.key --cookie-store=/data/cookies.json --share
+  if [ -n "${DIRECT_LISTEN:-}" ]; then
+    set -- "$@" --transports="direct:10,$transport:100" --direct-listen="$DIRECT_LISTEN" --share-host="$SHARE_HOST"
+  else
+    set -- "$@" --transport="$transport"
+  fi
+  if [ "$transport" = cupsonline ]; then
+    # The built-in wizard creates a reusable list; persist it before starting.
+    if [ ! -s /data/rooms ]; then
+      printf '%s\n' '{"method":"createRooms"}' | openflux --node-wizard | jq -er '.rooms' > /data/rooms.tmp
+      mv /data/rooms.tmp /data/rooms
+    fi
+    set -- "$@" --url="$(cat /data/rooms)"
+  fi
+else
+  if [ "$role" = exit-node ]; then
+    set -- --role=exit --mode=l4 --transport="$transport"
+  else
+    set -- --role=client --inbound=socks5 --transport="$transport"
+  fi
+fi
 
 if [ "$role" = client ]; then
   set -- "$@" --socks5 "$listen"
