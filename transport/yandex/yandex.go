@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -19,7 +18,6 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/p1neappleXpress/OpenFlux/netbind"
 	"github.com/p1neappleXpress/OpenFlux/transport"
 	"github.com/p1neappleXpress/OpenFlux/utils"
 )
@@ -100,15 +98,11 @@ func cursorInfo(userShortID string, seq int) string {
 	return cursorStream + ";" + base64.StdEncoding.EncodeToString(payload)
 }
 
-// buildSaveChanges собирает saveChanges-сообщение под конкретную сессию и
-// номер итерации: актуальные UserId/UserShortId и слегка меняющиеся позиции
-// курсора. Оригинальные entity-префиксы и модель-оп сохранены побайтово;
-// меняется только то, что действительно зависит от участника.
-func (t *YandexDocsTransport) buildSaveChanges(session *DocSession, seq int) []byte {
-	userID := session.Info.EditorUserID
-	if userID == "" {
-		userID = session.UserID // fallback: псевдо-id, если jwt не дал реального
-	}
+// BuildSaveChanges is the saveChanges message for one participant and
+// iteration (see buildSaveChanges for how the pieces are chosen). A pure
+// function of its arguments, exported so the JS port of this transport can be
+// compared with it byte for byte.
+func BuildSaveChanges(userID string, isExcel bool, seq int) []byte {
 	short := userID
 	if len(short) > 10 {
 		short = short[:10]
@@ -135,7 +129,7 @@ func (t *YandexDocsTransport) buildSaveChanges(session *DocSession, seq int) []b
 		"startSaveChanges":    true,
 		"endSaveChanges":      true,
 		"isCoAuthoring":       true,
-		"isExcel":             session.Info.IsExcel,
+		"isExcel":             isExcel,
 		"deleteIndex":         nil,
 		"excelAdditionalInfo": string(excelJSON),
 		"unlock":              false,
@@ -143,6 +137,18 @@ func (t *YandexDocsTransport) buildSaveChanges(session *DocSession, seq int) []b
 	}
 	body, _ := json.Marshal([]interface{}{"message", msg})
 	return append([]byte("42"), body...)
+}
+
+// buildSaveChanges собирает saveChanges-сообщение под конкретную сессию и
+// номер итерации: актуальные UserId/UserShortId и слегка меняющиеся позиции
+// курсора. Оригинальные entity-префиксы и модель-оп сохранены побайтово;
+// меняется только то, что действительно зависит от участника.
+func (t *YandexDocsTransport) buildSaveChanges(session *DocSession, seq int) []byte {
+	userID := session.Info.EditorUserID
+	if userID == "" {
+		userID = session.UserID // fallback: псевдо-id, если jwt не дал реального
+	}
+	return BuildSaveChanges(userID, session.Info.IsExcel, seq)
 }
 
 type YandexDocsInfo struct {
@@ -195,11 +201,17 @@ type YandexDocsTransport struct {
 	cookieJar *cookiejar.Jar
 	jarMu     sync.RWMutex
 
-	errNotifier func(err error, transportName, url, reason string)
+	errNotifier func(err error, transportName, url, html, reason string)
 
 	// cookiesApplied wakes a scheduleReconnectNoCaptcha wait early. Unbuffered
 	// on purpose: a send only succeeds while such a wait is in progress.
 	cookiesApplied chan struct{}
+
+	// reconnecting is set while a scheduled reconnect waits out its backoff: the
+	// reader's error and ApplyCookies both schedule one when the cookies are
+	// replaced under a live connection, and two reconnects open two sessions to
+	// the document (a second participant that stays).
+	reconnecting atomic.Bool
 }
 
 func NewYandexDocsTransport(url string, config transport.TransportConfig) *YandexDocsTransport {
@@ -298,7 +310,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 					reason = "login"
 				}
 				if t.errNotifier != nil {
-					t.errNotifier(err, "yandex", t.url, reason)
+					t.errNotifier(err, "yandex", t.url, "", reason)
 				}
 				t.scheduleReconnectNoCaptcha(attempt)
 				return
@@ -316,10 +328,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		// insufficient on iOS).
 		dialer := websocket.Dialer{
 			HandshakeTimeout: 15 * time.Second,
-			NetDialContext: netbind.Wrap(&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
+			NetDialContext:   dialIPv4First,
 		}
 		headers := http.Header{}
 		headers.Set("User-Agent", "Mozilla/5.0")
@@ -443,7 +452,12 @@ func (t *YandexDocsTransport) writerLoop() {
 		}
 
 		payload := base64.StdEncoding.EncodeToString(pending)
-		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+		// The cursor's numeric prefix must equal the actual binary packet
+		// length (before Base64), not a fixed constant: Yandex Disk does not
+		// relay cursor messages whose declared length does not match, so the
+		// hardcoded "18" silently dropped every packet and the VPN handshake
+		// timed out. Reported with an A/B wire test by @Gamazzz (issue #165).
+		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"%d;%s"}]`, len(pending), payload)
 		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 			utils.Debugf("[YDOCS] Write error: %v", err)
 			time.Sleep(15 * time.Millisecond)
@@ -552,6 +566,13 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 }
 
 func (t *YandexDocsTransport) extractBase64String(response string) string {
+	return ExtractBase64(response)
+}
+
+// ExtractBase64 pulls the packet payload out of a server frame: from a
+// saveChanges message's excelAdditionalInfo, otherwise from a cursor field.
+// Pure, and exported so the JS port can be compared with it.
+func ExtractBase64(response string) string {
 	if strings.Contains(response, "saveChanges") {
 		marker := `"excelAdditionalInfo":"`
 		left := strings.Index(response, marker) + len(marker)
@@ -578,6 +599,9 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 		return
 	}
 
+	if !t.reconnecting.CompareAndSwap(false, true) {
+		return // one is already waiting
+	}
 	// Back off before retrying so a server that closes us immediately doesn't
 	// turn into a tight connect/close loop (previously reconnect was instant).
 	d := reconnectBackoff(next)
@@ -585,8 +609,10 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	select {
 	case <-time.After(d):
 	case <-t.Done():
+		t.reconnecting.Store(false)
 		return
 	}
+	t.reconnecting.Store(false) // a failed connect schedules the next one itself
 	if !t.IsRunning() {
 		return
 	}
@@ -597,7 +623,7 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 
 // SetErrorNotifier installs a callback for out-of-band errors such as
 // ErrCaptchaRequired or ErrLoginRequired. Called once by the manager.
-func (t *YandexDocsTransport) SetErrorNotifier(fn func(err error, transportName, url, reason string)) {
+func (t *YandexDocsTransport) SetErrorNotifier(fn func(err error, transportName, url, html, reason string)) {
 	t.errNotifier = fn
 }
 
@@ -726,7 +752,8 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	}
 
 	client := &http.Client{
-		Jar: jar,
+		Jar:       jar,
+		Transport: carrierTransport(),
 		// НЕ следуем редиректам автоматически — обрабатываем вручную.
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
